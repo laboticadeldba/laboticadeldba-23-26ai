@@ -1,0 +1,189 @@
+Sección técnica — RMAN & pasos exactos para rolling RU en RAC
+
+Advertencia: este es un esquema operativo general. Adapta valores (ORACLE_HOME, DB_UNIQUE_NAME, NODEs, destinos de backup, etc.) a tu entorno. Revisa las Release Notes del RU 23.26.0 y los Known Issues en My Oracle Support antes de aplicar cambios.
+
+1) Backups previos (RMAN) — comandos rápidos
+
+Conéctate al servidor donde ejecutas RMAN (o desde bastion con acceso a Oracle) y ejecuta:
+
+# Exporta variables útiles
+export ORACLE_SID=ORCL
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0.0  # <- ajustar
+export PATH=$ORACLE_HOME/bin:$PATH
+
+# Conéctate a RMAN
+rman target /
+
+# Backup full y archivelogs
+RUN {
+  ALLOCATE CHANNEL c1 DEVICE TYPE DISK;
+  ALLOCATE CHANNEL c2 DEVICE TYPE DISK;
+  BACKUP AS COMPRESSED BACKUPSET DATABASE;
+  BACKUP AS COMPRESSED BACKUPSET ARCHIVELOG ALL DELETE INPUT;
+  BACKUP CURRENT CONTROLFILE;
+  RELEASE CHANNEL c1;
+  RELEASE CHANNEL c2;
+}
+
+# (Opcional) Backup del SPFILE si aplica
+BACKUP SPFILE;
+
+
+Notas:
+
+Ajusta el número de canales según I/O y configuración.
+
+Si usas un target SBT/Tape cambia DEVICE TYPE DISK por SBT_TAPE y parámetros del media manager.
+
+Si tienes Flashback DB activado y suficiente espacio, crea un restore point garantizado (opcional):
+
+-- desde sqlplus como sysdba (si flashback activado)
+ALTER SYSTEM CHECKPOINT;
+CREATE RESTORE POINT before_23_26 GUARANTEE FLASHBACK DATABASE;
+
+
+Si no tienes Flashback, asegúrate de tener RMAN + export lógico (expdp) de schemas críticos.
+
+2) Pre-checks en todo el cluster (importante)
+
+Antes de empezar, en cualquier nodo del cluster:
+
+# Verifica el estado de CRS/Clusterware
+crsctl check cluster -all
+crsctl stat res -t
+
+# Verificar que todos los servicios del DB están OK
+srvctl status database -d <DB_UNIQUE_NAME>
+
+# Revisar versión y homes
+sqlplus / as sysdba -S <<EOF
+SELECT instance_name, host_name, version FROM v$instance;
+EXIT;
+EOF
+
+# Inventario OPatch (ver que OPatch está actualizado)
+$ORACLE_HOME/OPatch/opatch lsinventory
+
+
+Además:
+
+Revisa espacio en ASM/FILESYSTEM para backups y temporales.
+
+Asegura que el usuario GRID (grid) y oracle tienen SSH passwordless entre nodos si necesitas ejecutar operaciones remotas.
+
+Confirma que datapatch y opatch están disponibles en ORACLE_HOME.
+
+3) Estrategia general rolling RU en RAC (pasos)
+
+Resumen: aplicas el RU por Oracle Home y por nodo, minimizando downtime porque solo reinicias la instancia local de cada nodo. Secuencia típica:
+
+GI (Grid Infrastructure)
+
+Si el RU incluye cambios a Grid Infrastructure (GI), aplica RU al GI home antes de tocar homes de DB. GI patching en cluster suele tener su propio procedimiento rolling. Sigue las instrucciones de GI patch README.
+
+DB Home (por nodo, rolling)
+
+Para cada nodo N del RAC, en orden (por ejemplo: node1 → node2 → node3):
+a. Mover cargas (si aplica): opcionalmente migrar servicios si tienes servicios preferidos.
+b. Detener la instancia local en ese nodo (no todo el DB):
+
+srvctl stop instance -d <DB_UNIQUE_NAME> -i <INSTANCENAME_on_nodeN>
+
+
+c. Aplicar RU al Oracle Home en ese nodo:
+
+Usando opatch / opatchauto o el procedimiento indicado en Release Notes. Ejemplo (genérico):
+
+cd $ORACLE_HOME/OPatch
+./opatch lsinventory
+./opatch apply /path/to/23.26.0_patch_dir -silent
+
+
+Si Oracle recomienda opatchauto, usa:
+
+$ORACLE_HOME/OPatch/opatchauto apply /path/to/23.26.0_patch_dir -oh $ORACLE_HOME
+
+
+d. Aplicar datapatch (aplica cambios SQL/PSU a catálogo):
+
+# desde el mismo ORACLE_HOME
+$ORACLE_HOME/OPatch/datapatch -verbose
+
+
+Si datapatch requiere conexión, se conecta como SYS (asegúrate de la env vars).
+e. Arrancar la instancia local:
+
+srvctl start instance -d <DB_UNIQUE_NAME> -i <INSTANCENAME_on_nodeN>
+
+
+f. Validar:
+
+Revisar alert.log y dba_registry_sqlpatch para errores.
+
+Ejecutar consultas de smoke test (conexión, transacciones simples).
+g. Repetir para siguiente nodo.
+
+Post-rolling checks
+
+Cuando todas las instancias estén parchadas y activas:
+
+# Revisa parches aplicados
+$ORACLE_HOME/OPatch/opatch lsinventory
+sqlplus / as sysdba -S <<EOF
+SELECT action, version, status FROM dba_registry_sqlpatch ORDER BY id DESC;
+EXIT;
+EOF
+
+
+Ejecuta AWR/ASH sanity checks sobre latencias, load y tiempos de response.
+
+Revisa métricas de vector search / AI si corresponde (si activaste features nuevas).
+
+4) Ejemplo concreto (secuencia simplificada)
+
+Supongamos DB BOTICADB, nodos node1 node2 node3, instancia por nodo botica1, botica2, botica3.
+
+En node1:
+
+# set env adecuado
+export ORACLE_HOME=/u01/app/oracle/product/23.26_home
+export PATH=$ORACLE_HOME/bin:$PATH
+export ORACLE_SID=botica1
+
+# Stop local instance
+srvctl stop instance -d BOTICADB -i botica1
+
+# Apply OPatch to local ORACLE_HOME (ejemplo)
+cd $ORACLE_HOME/OPatch
+./opatch lsinventory
+./opatch apply /u01/patches/23.26.0 -silent
+
+# Start local instance
+srvctl start instance -d BOTICADB -i botica1
+
+# Run datapatch after instance is up (or as recommended)
+$ORACLE_HOME/OPatch/datapatch -verbose
+
+# Quick health checks
+srvctl status instance -d BOTICADB -i botica1
+
+
+Repetir para node2, node3.
+
+5) Rollback / Plan de contingencia
+
+Ten listo el plan de restauración RMAN y el procedimiento para restaurar el ORACLE_HOME si es necesario.
+
+Si la plataforma lo soporta, tener snapshot del filesystem (o snapshot de VM) previo al RU acelera rollback.
+
+Si hay fallo irreparable tras datapatch, evalúa rollback con MOS y soporte Oracle; no intentes reverse-opatch sin metodología clara.
+
+6) Comprobaciones post-upgrade que no olvidar
+
+Validar dba_registry y dba_registry_sqlpatch.
+
+Revisar AWR top SQL antes/después para detectar regressions.
+
+Validar trabajos batch, ETL, Data Pump y agentes externos (JDBC/ODP.NET/python-oracledb).
+
+Si usas vector search/AI features: correr conjunto de queries de latencia y ver consumo de MEM/CPU.
